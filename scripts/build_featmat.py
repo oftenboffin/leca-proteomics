@@ -1,6 +1,20 @@
 """
 Script for building a feature matrix given a directory of CSV or pickle files containing features. Can merge 20M rows x 10K columns across ~40 files given ~250GB of RAM in about an hour. Bigger data sets may require more time/RAM, while more files will require you to run this script on smaller subsets of the data before performing a final merge on the pre-built subset feature matrices.
 @author: Rachael Cox <rachaelcox@utexas.edu>
+
+Modified by Akshaya Rajaraman <arajar4@uic.edu>
+- Updated make_fset() to accept a row with separate ID1 and ID2 
+columns instead of a single space-delimited ID string, to match input .feat file format.
+- Updated read_files() to drop 'ID1' and 'ID2' columns instead
+  of 'ID', and use row-wise iteration for make_fset().
+- Updated build_fmat() to accept optional suffixes parameter for
+  handling duplicate column names (e.g. pearsonR) across feature files.
+- Disabled fillna(0) in build_fmat() to preserve NaN values in
+  the merged feature matrix.
+- Added -s/--suffixes argument to CLI for labeling feature columns
+  by file name when column names conflict.
+
+
 """
 
 __author__ = "Rachael Cox (rachaelcox@utexas.edu)"
@@ -17,19 +31,13 @@ import time
 import numpy as np
 from datetime import datetime as dt
 
-def make_fset(x, drop=True):
-    if len(set(x.split(' '))) < 2:
-        print(f"WARNING: Features for '{x}-{x}' (self-self PPI) detected ...")
-        if drop == False:
-            x1 = x.split(' ')[0]
-            fset = frozenset({x1,x1})
-            return(fset)
-        else:
-            return(None)
+def make_fset(row):
+    x1, x2 = row['ID1'], row['ID2']
+    if x1 == x2:
+        print(f"WARNING: Features for '{x1}-{x2}' (self-self PPI) detected ...")
+        return None
     else:
-        x1 = x.split(' ')[0]
-        x2 = x.split(' ')[1]
-        fset = frozenset({x1,x2})
+        fset = frozenset({x1, x2})
         return(fset)
 
 def read_files(data_dir, pickle_files=False):  
@@ -45,8 +53,11 @@ def read_files(data_dir, pickle_files=False):
             with open(data_dir+f, 'rb') as handle:
                 df = pickle.load(handle)
             df = df.round(4)
-            df['frozen_pair'] = [make_fset(i) for i in df['ID']]
-            df.drop(['ID'], axis=1, inplace=True)
+            #arajar4: ID1 and ID2 are two columns in my .feat document
+            #df['frozen_pair'] = [make_fset(i) for i in df['ID']]
+            df['frozen_pair'] = [make_fset(row) for _, row in df.iterrows()]
+            #df.drop(['ID'], axis=1, inplace=True)
+            df.drop(['ID1','ID2'], axis=1, inplace=True)
             df.dropna(subset=['frozen_pair'], inplace=True)
             fmat_list.append(df)
     else:
@@ -56,8 +67,10 @@ def read_files(data_dir, pickle_files=False):
             print(f' ► Reading {f} ...')
             df = pd.read_csv(data_dir+f)
             df = df.round(4)
-            df['frozen_pair'] = [make_fset(i) for i in df['ID']]
-            df.drop(['ID'], axis=1, inplace=True)
+            #df['frozen_pair'] = [make_fset(i) for i in df['ID']]
+            df['frozen_pair'] = [make_fset(row) for _, row in df.iterrows()]
+            #df.drop(['ID'], axis=1, inplace=True)
+            df.drop(['ID1','ID2'], axis=1, inplace=True)
             df.dropna(subset=['frozen_pair'], inplace=True)
             fmat_list.append(df)
     return(fmat_list)
@@ -73,19 +86,21 @@ def get_left_join_idx(data_dir, pickle_files, left_file):
         left_index = flist.index(left_file)
         return(left_index)
     
-def build_fmat(fmat_list, join_type='outer', left_index=None):
+def build_fmat(fmat_list, join_type='outer', left_index=None, suffixes=None):
     t0 = time.time()
     for df in fmat_list:
         df.set_index(['frozen_pair'], inplace=True)
     if join_type == 'outer':
-        fmat = reduce(lambda x, y: x.join(y, how='outer'), fmat_list)
-        fmat.fillna(0, inplace=True)
+        fmat = reduce(lambda x, y: x.join(y, how='outer', rsuffix=suffixes), fmat_list)
+        #arajar4:I want to keep nan values here
+        #fmat.fillna(0, inplace=True)
     elif join_type == 'left':
         fmat = fmat_list[left_index]
         fmat_list.pop(left_index)
-        for df in fmat_list:
-            fmat = fmat.join(df, how='left')
-            fmat.fillna(0, inplace=True)
+        for df, suffix in zip(fmat_list, suffixes):
+            fmat = fmat.join(df, how='left', rsuffix=suffixes)
+            #arajar4:I want to keep nan values here
+            #fmat.fillna(0, inplace=True)
     fmat.reset_index(inplace=True)
     fmat['ID'] = [' '.join(list(i)) for i in fmat['frozen_pair']]
     fmat.drop(['frozen_pair'], axis=1, inplace=True)
@@ -119,9 +134,11 @@ def main():
     print(f'[{dt.now()}] Merging feature matrices ...')
     if args.left_join_file:
         left_idx = get_left_join_idx(args.directory, args.pickle, args.left_join_file)
-        fmat = build_fmat(fmat_list, join_type='left', left_index=left_idx)
+        print(args.suffixes)
+        fmat = build_fmat(fmat_list, join_type='left', left_index=left_idx, suffixes=args.suffixes)
     else:
-        fmat = build_fmat(fmat_list)
+        print(args.suffixes)
+        fmat = build_fmat(fmat_list, suffixes=args.suffixes)
     # write out results
     write_fmat(fmat, args.directory, args.outfile_name)
     print(f'[{dt.now()}] Done!')
@@ -136,6 +153,9 @@ if __name__ == "__main__":
 
     # specify directory (required)
     parser.add_argument("-d", "--directory", help="(Required) path to directory where feature files are located. Must be CSV or pickled files.")
+    
+    #specify labels for feature values if they have the same column name (eg. pearsonR)
+    parser.add_argument("-s", "--suffixes", action="store", nargs='+', default=None, help="(optional) Specify the labels of the pearsonR values along with file name.")
 
     # specify if pickle files (default=false)
     parser.add_argument("-p", "--pickle", action="store_true", default=False, help="(Optional) specify this argument to indicate features are compressed into pickle files (will significantly speed up run time).")
@@ -145,7 +165,7 @@ if __name__ == "__main__":
 
     # specify outfile name (default='featmat', written to the given data directory)
     parser.add_argument("-o", "--outfile_name", action="store", default=None, help="(Optional) specify the outfile path/name (defaults are 'featmat' and 'featmat.pkl', written to the given feature directory).")
-
+    
     # specify output of "--version"
     parser.add_argument(
         "--version",
